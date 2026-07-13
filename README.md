@@ -8,6 +8,18 @@ Unlike modern Vista panels (which use ECP addressable keypads), older generation
 
 ---
 
+🌐 A note on language (Italian strings)
+This firmware was written for the author's own installation, so some strings are in Italian — most visibly the entity names / entity_ids it generates, the ZONE_NAMES array, and the log messages. Nothing about the protocol decoding is language-dependent; it's purely cosmetic labelling.
+If you're not Italian, you'll want to change:
+
+entity_id / entity names — rename them to your language in the ESPHome YAML (or in Home Assistant after import). You'd typically rename these anyway to match your own naming scheme.
+ZONE_NAMES in ademco4110.h — these are your own zone labels regardless of language; see the zone-customisation section.
+Log messages (optional) — the ESP_LOGx strings in ademco4110.cpp are in Italian. They don't affect behaviour; translate them only if you want English logs.
+
+None of this changes how the firmware works — it decodes the bus identically whatever the labels say. Treat the Italian strings as defaults to be localised, the same way you'd adapt the zone names to your own house. PRs that make the strings configurable (or add an English baseline) are welcome.
+
+---
+
 ## 📑 Table of contents
 
 - [Which quadrant are you in?](#-which-quadrant-are-you-in-protocol-landscape)
