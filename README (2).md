@@ -272,6 +272,9 @@ Two **4N35** optocouplers isolate the ESP32 from the keybus:
 
 Note the 4N35 is a 6-pin device (pinout differs from the 4-pin PC817 used in gregrenda's original circuit).
 
+⚠️ Safety warning — mains voltage inside the panel. The alarm panel enclosure contains 230 V AC mains wiring (the transformer primary). Mains voltage can kill. Before opening the panel or touching any wiring, disconnect mains power (unplug the transformer / switch off the dedicated breaker) and disconnect the backup battery. Work on the bus interface only on the low-voltage side, with the panel de-energised. If you are not confident working safely around mains electricity, have a qualified electrician do it.
+No warranty / no liability. This project is provided "as is", for educational and personal use, with no warranty of any kind. You follow it entirely at your own risk. I accept no responsibility for any damage, injury, loss, malfunction, voided warranty, or compromised alarm/security system resulting from the use of this information, hardware, or firmware. Modifying your alarm panel may void manufacturer warranties, violate monitoring-service agreements, or affect insurance coverage — verify before proceeding.
+
 ---
 
 ## 🔌 Powering the ESP32
