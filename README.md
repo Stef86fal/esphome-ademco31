@@ -294,14 +294,14 @@ The panel scrolls zone **numbers** (1–8) on the bus; the human-readable names 
 ```cpp
 static constexpr const char* ZONE_NAMES[9] = {
     "",                    // index 0 — unused (zones are 1-based)
-    "BASCULANTI",          // zone 1
-    "PORTA INGRESSO",      // zone 2
-    "VOLUMETRICO PT",      // zone 3
-    "TAPPARELLE PT",       // zone 4
-    "VOLUMETRICO 1P",      // zone 5
-    "TAPPARELLE 1P",       // zone 6
-    "TAMPER",              // zone 7
-    "TAMPER COMB"          // zone 8
+    "ZONE 1",     // zone 1
+    "ZONE 2",     // zone 2
+    "ZONE 3",     // zone 3
+    "ZONE 4",     // zone 4
+    "ZONE 5",     // zone 5
+    "ZONE 6",     // zone 6
+    "ZONE 7",     // zone 7
+    "ZONE 8"      // zone 8
 };
 ```
 
