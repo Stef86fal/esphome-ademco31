@@ -273,6 +273,9 @@ ademco4110:
 
 ### Circuit schematic
 
+⚠️ Safety warning — mains voltage inside the panel. The alarm panel enclosure contains 230 V AC mains wiring (the transformer primary). Mains voltage can kill. Before opening the panel or touching any wiring, disconnect mains power (unplug the transformer / switch off the dedicated breaker) and disconnect the backup battery. Work on the bus interface only on the low-voltage side, with the panel de-energised. If you are not confident working safely around mains electricity, have a qualified electrician do it.
+No warranty / no liability. This project is provided "as is", for educational and personal use, with no warranty of any kind. You follow it entirely at your own risk. I accept no responsibility for any damage, injury, loss, malfunction, voided warranty, or compromised alarm/security system resulting from the use of this information, hardware, or firmware. Modifying your alarm panel may void manufacturer warranties, violate monitoring-service agreements, or affect insurance coverage — verify before proceeding.
+
 ![Ademco 4120 ↔ ESP32 bus interface with 4N35 optocouplers](Ademco_4120_circuit.png)
 
 Two **4N35** optocouplers isolate the ESP32 from the keybus:
@@ -332,14 +335,14 @@ The panel scrolls zone **numbers** (1–8); the names are mapped in one array. E
 ```cpp
 static constexpr const char* ZONE_NAMES[9] = {
     "",                    // index 0 — unused (zones are 1-based)
-    "BASCULANTI",          // zone 1
-    "PORTA INGRESSO",      // zone 2
-    "VOLUMETRICO PT",      // zone 3
-    "TAPPARELLE PT",       // zone 4
-    "VOLUMETRICO 1P",      // zone 5
-    "TAPPARELLE 1P",       // zone 6
-    "TAMPER",              // zone 7
-    "TAMPER COMB"          // zone 8
+    "ZONE 1",      // zona 1
+    "ZONE 2",      // zona 2
+    "ZONE 3",      // zona 3
+    "ZONE 4",      // zona 4
+    "ZONE 5",      // zona 5
+    "ZONE 6",      // zona 6
+    "ZONE 7",      // zona 7
+    "ZONE 8"       // zona 8
 };
 ```
 
