@@ -1,0 +1,217 @@
+substitutions:
+  device_name: "ademco4120"
+  friendly_name: "Allarme Ademco 4120"
+  # Sostituisci con il tuo codice utente (es. 1234 + tasto funzione)
+  # 1 = OFF/Disinserisci, 2 = Inserisci Totale (AWAY), 3 = Inserisci Parziale (STAY)
+  alarm_arm_total:   "****2"   # codice + 2
+  alarm_arm_partial: "****3"   # codice + 3
+  alarm_disarm:      "****1"   # codice + 1
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: esp-idf
+    advanced:
+      # Chip confermato rev3.1 dal log di boot: riduce il binario eliminando
+      # i workaround per revisioni piu' vecchie, che non ci servono.
+      minimum_chip_revision: "3.1"
+      # sram1_as_iram NON va abilitato finche' il bootloader non e' aggiornato
+      # (richiede un flash via USB): con bootloader vecchio puo' bloccare il
+      # dispositivo. Da aggiungere solo dopo il prossimo flash via cavo.
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.1.247
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+  ap:
+
+uart:
+  id: panel_uart
+  rx_pin:
+    number: GPIO21
+    inverted: true
+  baud_rate: 2400
+  parity: EVEN
+  stop_bits: 2
+  data_bits: 8
+
+logger:
+  baud_rate: 115200
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ademco4110]
+
+ademco4110:
+  id: panel
+  uart_id: panel_uart
+  sync_pin:
+    number: GPIO35
+    inverted: true
+  diagnostic_mode: false
+  # Codice utente (senza tasto funzione) usato per uscire dalla scansione zone
+  # Es. se il tuo codice OFF e' "12341", qui va "1234"
+  disarm_code: "****"
+
+binary_sensor:
+  - platform: ademco4110
+    name: "Inserito"
+    type: armed
+    device_class: lock
+
+  - platform: ademco4110
+    name: "Inserito Totale"
+    type: armed_total
+
+  - platform: ademco4110
+    name: "Inserito Parziale"
+    type: armed_partial
+
+  - platform: ademco4110
+    name: "Allarme"
+    type: alarm
+    device_class: safety
+
+  - platform: ademco4110
+    name: "Chime"
+    type: chime
+
+  - platform: ademco4110
+    name: "Pronto"
+    type: ready
+
+  - platform: ademco4110
+    name: "Zona Esclusa"
+    type: bypass
+
+  - platform: ademco4110
+    name: "Rete 220V"
+    type: ac_power
+
+  - platform: ademco4110
+    name: "Batteria Scarica"
+    type: battery_low
+
+  - platform: ademco4110
+    name: "Comunicazione Bus"
+    type: bus_ok
+    device_class: connectivity
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: ademco4110
+    name: "Stato Sistema"
+    type: status
+    icon: "mdi:shield-home"
+
+  - platform: ademco4110
+    name: "Zone Aperte"
+    type: zones
+    icon: "mdi:door-open"
+
+  - platform: ademco4110
+    name: "Zona Bypass Modificata"
+    type: zone_changed
+    icon: "mdi:door-closed-lock"
+
+  - platform: ademco4110
+    name: "Zona Allarme"
+    type: alarm_zone
+    icon: "mdi:alert"
+
+  - platform: wifi_info
+    bssid:
+      name: "WiFi BSSID"
+      icon: "mdi:access-point-network"
+      entity_category: diagnostic
+
+button:
+  - platform: template
+    name: "Inserisci Totale"
+    icon: "mdi:shield-lock"
+    on_press:
+      - lambda: id(panel).send_keys("${alarm_arm_total}");
+
+  - platform: template
+    name: "Inserisci Parziale"
+    icon: "mdi:shield-half-full"
+    on_press:
+      - lambda: id(panel).send_keys("${alarm_arm_partial}");
+
+  - platform: template
+    name: "Disinserisci"
+    icon: "mdi:shield-off"
+    on_press:
+      - lambda: id(panel).send_keys("${alarm_disarm}");
+
+  - platform: template
+    name: "Scansiona Zone Aperte"
+    icon: "mdi:magnify-scan"
+    on_press:
+      - ademco4110.scan_zones: panel
+
+  - platform: restart
+    name: "Riavvia ESP32"
+    icon: "mdi:restart"
+    entity_category: diagnostic
+
+sensor:
+  - platform: internal_temperature
+    name: "Temperatura ESP32"
+    icon: "mdi:thermometer"
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "Segnale WiFi"
+    icon: "mdi:wifi"
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    icon: "mdi:clock-outline"
+    entity_category: diagnostic
+
+text:
+  - platform: template
+    name: "Invia Tasti"
+    id: send_keys_input
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 15
+    set_action:
+      - delay: 200ms
+      - lambda: |-
+          // La card mobile aggiunge "|N" in fondo (contatore anti-duplicato,
+          // serve a forzare l'azione anche su invii identici consecutivi).
+          // Va scartato qui: le sue cifre altrimenti verrebbero interpretate
+          // come tasti veri e aggiunte in coda alla sequenza reale.
+          std::string keys = x.substr(0, x.find('|'));
+          if (!keys.empty()) {
+            id(panel).send_keys(keys.c_str());
+            id(send_keys_input).publish_state("");
+          }
+
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          id(send_keys_input).publish_state("");
