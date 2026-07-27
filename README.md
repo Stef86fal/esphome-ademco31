@@ -197,14 +197,14 @@ B3 bit7 is the INSTANT bit. MAX = "armed away + instant", so it sets bit7; a gen
 
 | Separator | Zone | Example name |
 |---|---|---|
-| F4 | 1 | BASCULANTI |
-| EC | 2 | PORTA INGRESSO |
-| E4 | 3 | VOLUMETRICO PT |
-| DC | 4 | TAPPARELLE PT |
-| D4 | 5 | VOLUMETRICO 1P |
-| CC | 6 | TAPPARELLE 1P |
-| C4 | 7 | TAMPER |
-| BC | 8 | TAMPER COMB |
+| F4 | 1 | ZONE 1 |
+| EC | 2 | ZONE 2 |
+| E4 | 3 | ZONE 3 |
+| DC | 4 | ZONE 4 |
+| D4 | 5 | ZONE 5 |
+| CC | 6 | ZONE 6 |
+| C4 | 7 | ZONE 7 |
+| BC | 8 | ZONE 8 |
 
 Passive zone reading (without `*`) is **not** reliable for open zones: with everything closed, the separator cycles on its own. Always use the `*` scan or read during an actual alarm. **v2 exception:** for *bypass* events the separator is reliable **because** it is qualified by the following `D6 5E 16` frame.
 
