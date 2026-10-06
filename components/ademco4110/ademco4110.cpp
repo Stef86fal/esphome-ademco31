@@ -2,6 +2,7 @@
 #include "esphome/core/log.h"
 #include <esp_timer.h>
 #include <esp_rom_gpio.h>
+#include <esp_rom_sys.h>   // esp_rom_delay_us (offset fine TX deterministica)
 #include <driver/gpio.h>
 #include <driver/rmt_tx.h>
 #include <driver/rmt_encoder.h>
@@ -14,24 +15,21 @@ namespace ademco4110 {
 static const char *TAG = "ademco4120";
 
 // ─────────────────────────────────────────────────────────────
-//  Mappatura bit — documentazione gregrenda non-addressable
-//  Il frame di stato valido e' quello che precede 0x0C
-//  (separatore variabile: 0xDC, 0xD4 ecc.)
+//  Mappatura bit CONFERMATA EMPIRICAMENTE sul 4120+4127.
+//  ATTENZIONE: NON coincide con le posizioni di gregrenda (valide per
+//  pannelli/tastiere diversi) — qui valgono quelle misurate sul nostro ferro.
 //
-//  Byte 2 (B2):
-//    bit 4 0x10 = READY LED (verde) -> pronto
-//    bit 5 0x20 = FIRE
-//    bit 6 0x40 = BAT
-//    bit 7 0x80 = STAY / red ARMED led
+//  Frame di STATO (separatore 0x24, B0=0xF9, precede lo 0x0C):
+//    B2 bit1 (0x02) = READY    (attivo basso: 0 = pronto)
+//    B2 bit6 (0x40) = BATTERIA (attivo basso; falso positivo col bypass -> soppresso)
+//    B2 bit7 (0x80) = BYPASS   (attivo basso: 0 = bypass attivo)
+//    B3 bit1 (0x02) = CHIME    (bit di display: invertito con bypass e armato-totale -> compensato in XOR)
 //
-//  Byte 3 (B3):
-//    bit 1 0x02 = ALARM
-//    bit 2 0x04 = AWAY / red ARMED led
-//    bit 3 0x08 = AC (disable NO AC)
-//    bit 4 0x10 = BYPASS
-//    bit 5 0x20 = CHIME
-//    bit 6 0x40 = disable NOT READY
-//    bit 7 0x80 = INSTANT
+//  Frame ARMATO/ALLARME (0x0C):
+//    B2 bit7 (0x80) = ARMED
+//    B3 bit1 (0x02) = ALARM    (solo se B3 bit7==0; bit7=1 = modo MAX, non allarme)
+//
+//  PARZIALE: 2o frame 0x04 dopo lo 0x0C, B2 bit6 (0x40).
 // ─────────────────────────────────────────────────────────────
 
 void Ademco4110Component::rmt_tx_init() {
@@ -88,7 +86,16 @@ void Ademco4110Component::rmt_tx_send_key(uint8_t key) {
   tx_config.flags.eot_level = 1;  // linea idle-high a fine trasmissione (come RMT_IDLE_LEVEL_HIGH)
   ESP_ERROR_CHECK(rmt_transmit(rmt_tx_chan_, rmt_copy_encoder_, items,
                                 idx * sizeof(rmt_symbol_word_t), &tx_config));
-  ESP_ERROR_CHECK(rmt_tx_wait_all_done(rmt_tx_chan_, portMAX_DELAY));
+  // Attesa limitata invece di portMAX_DELAY: se il canale RMT si pianta (visto in
+  // campo, vedi commento in setup()) l'attesa infinita congelava sync_task per
+  // sempre, e con key_sending_ bloccato a true num_keys_ non tornava mai a zero:
+  // da li' in poi ogni send_keys() usciva con "TX in corso" e la tastiera moriva
+  // in silenzio. Niente ESP_ERROR_CHECK: un timeout va loggato, non deve far
+  // abortire la scheda.
+  esp_err_t err = rmt_tx_wait_all_done(rmt_tx_chan_, pdMS_TO_TICKS(RMT_TX_TIMEOUT_MS));
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "RMT TX non completata: %s", esp_err_to_name(err));
+  }
 }
 
 void Ademco4110Component::setup() {
@@ -102,7 +109,29 @@ void Ademco4110Component::setup() {
   if (sync_pin_) {
     sync_pin_->setup();
     sync_pin_->pin_mode(gpio::FLAG_INPUT);
-    xTaskCreatePinnedToCore(sync_task, "sync_task", 2048, this, 24, nullptr, 0);
+    if (deterministic_tx_) {
+      // TX deterministica: coda tasti + tx_task ad alta priorita' svegliato da un
+      // ISR sul sync pin. A differenza del vecchio busy-loop a prio 24 (che
+      // affamava il WiFi girando a ogni tick), qui il task e' BLOCCATO su una
+      // notifica: 0% CPU a riposo, si sveglia solo quando c'e' un tasto in coda a
+      // un impulso di sync. L'allineamento fine alla finestra avviene da t_sync
+      // catturato nell'ISR -> lo scheduler e' fuori dal percorso del trigger.
+      // Stack 4096 come sync_task (chiama rmt_tx_init()). L'ISR la installa
+      // ESPHome (attach_interrupt): e' core-agnostica, tocca solo timestamp+notify.
+      key_queue_ = xQueueCreate(16, sizeof(uint8_t));
+      xTaskCreatePinnedToCore(tx_task, "tx_task", 4096, this, 24, &tx_task_handle_, 0);
+      sync_pin_->attach_interrupt(&Ademco4110Component::sync_isr, this,
+                                  gpio::INTERRUPT_ANY_EDGE);
+    } else {
+      // Stack 4096: il task chiama rmt_tx_init() (driver RMT dell'IDF) e ESP_LOGI,
+      // catena che con 2048 byte era al limite dell'overflow -> panic e reboot.
+      // Priorita' 10 (era 24): sul core 0 girano il task WiFi (23) e lo stack
+      // TCP/IP (18); a 24 il sync_task li scavalcava e affamava la rete -> timeout
+      // API. A 10 resta ben sopra il loop ESPHome (prio 1), quindi i tasti partono
+      // comunque in fretta, ma non preempta piu' la rete: cosi' si possono togliere
+      // i timeout API SENZA tenere la radio WiFi sempre accesa (power_save: light).
+      xTaskCreatePinnedToCore(sync_task, "sync_task", 4096, this, 10, nullptr, 0);
+    }
   }
   system_state_ = STATE_UNKNOWN;
   publish_all();
@@ -115,6 +144,9 @@ void Ademco4110Component::dump_config() {
   ESP_LOGCONFIG(TAG, "  TX GPIO: %d", (int)TX_GPIO);
   ESP_LOGCONFIG(TAG, "  sync_pin: %s", sync_pin_ ? "OK" : "non configurato");
   ESP_LOGCONFIG(TAG, "  diagnostic_mode: %s", diagnostic_mode_ ? "ON" : "off");
+  ESP_LOGCONFIG(TAG, "  raw_dump: %s", raw_dump_ ? "ON" : "off");
+  ESP_LOGCONFIG(TAG, "  parser: %s", new_parser_ ? "NUOVO (marcatori+debounce)" : "vecchio (2 zeri)");
+  ESP_LOGCONFIG(TAG, "  TX: %s", deterministic_tx_ ? "deterministica (ISR+task prio24)" : "sync_task (polling prio10)");
 }
 
 void Ademco4110Component::sync_task(void *arg) {
@@ -147,11 +179,106 @@ void Ademco4110Component::sync_task(void *arg) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+//  TX DETERMINISTICA (deterministic_tx: true)
+//  sync_isr: aggancia il sync col MEDESIMO criterio del polling
+//  (diff > SYNC_MIN_US), ma via interrupt (latenza ~0, niente jitter di
+//  scheduling). Non chiama l'RMT (non ISR-safe): passa solo l'istante hardware
+//  t_sync nella notifica e sveglia tx_task. isr_last_edge_us_ e' toccato solo
+//  qui (un core) -> nessun lock. La coda e' l'unica sorgente di "c'e' da
+//  trasmettere": se e' vuota non si notifica e il task resta a dormire.
+// ─────────────────────────────────────────────────────────────
+void IRAM_ATTR Ademco4110Component::sync_isr(Ademco4110Component *self) {
+  int64_t now = esp_timer_get_time();
+  int64_t diff = now - self->isr_last_edge_us_;
+  self->isr_last_edge_us_ = now;
+  if (diff > (int64_t) SYNC_MIN_US) {
+    self->isr_sync_count_++;   // diag: conteggio impulsi di sync (vivo/fermo in idle)
+    if (uxQueueMessagesWaitingFromISR(self->key_queue_) > 0) {
+      BaseType_t hpw = pdFALSE;
+      // t_sync a 32 bit nel valore di notifica: lettura atomica lato task
+      // (niente torn-read di un int64) e sempre l'ultimo sync se ne arriva un altro.
+      xTaskNotifyFromISR(self->tx_task_handle_, (uint32_t) now,
+                         eSetValueWithOverwrite, &hpw);
+      portYIELD_FROM_ISR(hpw);
+    }
+  }
+}
+
+// tx_task: prio 24 (sopra il WiFi) ma BLOCCATO su xTaskNotifyWait -> 0% CPU
+// finche' non c'e' un sync con tasti in coda. Si sveglia, si riallinea con
+// precisione all'istante hardware (residuo dei TX_OFFSET_US via busy-wait
+// cortissimo, solo mentre invia), poi trasmette. rmt_tx_send_key resta identico
+// (3x burst) e la sua attesa fine-TX rilascia la CPU al WiFi durante gli ~11ms
+// di clock hardware, quindi il core 0 e' trattenuto solo per l'offset.
+void Ademco4110Component::tx_task(void *arg) {
+  auto *self = static_cast<Ademco4110Component *>(arg);
+  self->rmt_tx_init();  // canale RMT creato/usato sullo stesso core (0), come sync_task
+  int64_t last_key_us = -(int64_t) MIN_KEY_GAP_US;  // il primo tasto parte subito
+  for (;;) {
+    uint32_t t_sync_lo = 0;
+    xTaskNotifyWait(0, 0xFFFFFFFFUL, &t_sync_lo, portMAX_DELAY);
+    // Ritmo minimo tra tasti: il pannello si impalla se arrivano piu' veloci di
+    // ~0.5s (indicazione del tecnico, confermata dai log: raffiche a 0.2s
+    // mandavano il display in churn -> sync affamato -> stallo -> a volte codice
+    // scartato). Se non e' passato abbastanza, salta questo sync: il tasto resta
+    // in coda e l'ISR ci risveglia al prossimo (pacing naturale sui sync).
+    if (esp_timer_get_time() - last_key_us < (int64_t) MIN_KEY_GAP_US)
+      continue;
+    uint8_t key;
+    if (xQueueReceive(self->key_queue_, &key, 0) == pdTRUE) {
+      uint32_t elapsed = (uint32_t) esp_timer_get_time() - t_sync_lo;
+      if (elapsed < TX_OFFSET_US)
+        esp_rom_delay_us(TX_OFFSET_US - elapsed);
+      self->rmt_tx_send_key(key);
+      last_key_us = esp_timer_get_time();
+      self->last_tx_ms_ = millis();
+      if (self->diagnostic_mode_)
+        ESP_LOGI(TAG, "TX 0x%02X elapsed=%uus coda=%d sync=%u", key,
+                 (unsigned) elapsed,
+                 (int) uxQueueMessagesWaiting(self->key_queue_),
+                 (unsigned) self->isr_sync_count_);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  RAW DUMP — byte grezzi dal bus, PRIMA del parsing (opt-in raw_dump: true).
+//  Affianca il DIAG, non lo sostituisce: una riga per frame, allineata al
+//  DIAG corrispondente, per confrontarle riga per riga e vedere se uno 0x00
+//  spurio (impulso di sync/inter-byte) e' finito dentro i 4 byte dati.
+//  NB: le DURATE degli impulsi non sono qui. La RX e' via UART, che decodifica
+//  i byte e scarta il timing inter-byte (l'RMT e' solo TX). Catturare gli
+//  impulsi da 1/6/17ms richiederebbe un canale RMT RX o un ISR sul pin bus:
+//  intervento separato, non incluso in questa modalita'.
+// ─────────────────────────────────────────────────────────────
+void Ademco4110Component::raw_flush() {
+  if (raw_len_ == 0) return;
+  char hex[3 * sizeof(raw_buf_) + 1];
+  size_t p = 0;
+  for (uint8_t i = 0; i < raw_len_; i++)
+    p += snprintf(hex + p, sizeof(hex) - p, "%02X ", raw_buf_[i]);
+  if (p > 0) hex[p - 1] = '\0';  // togli lo spazio finale
+  ESP_LOGI(TAG, "RAW [t=%llu] len=%u : %s",
+           (unsigned long long) raw_first_us_, raw_len_, hex);
+  raw_len_ = 0;
+}
+
+// Marcatori validi noti sul bus: 0x24/0x0C/0x04 + separatori zona, cioe' i sep
+// con (0xFC - sep)/8 in 1..8 -> 0xF4,0xEC,0xE4,0xDC,0xD4,0xCC,0xC4,0xBC.
+// Usato solo dal nuovo framer (new_parser) per agganciare l'inizio del frame.
+static bool is_marker(uint8_t b) {
+  if (b == 0x04 || b == 0x0C || b == 0x24) return true;
+  if (b >= 0xBC && b <= 0xF4 && ((0xFC - b) % 8) == 0) return true;
+  return false;
+}
+
 void Ademco4110Component::loop() {
   uint32_t now = millis();
 
   if (parse_state_ != WAIT_HEADER && last_parse_ms_ && (now - last_parse_ms_) > 2000) {
     ESP_LOGW(TAG, "Parser reset");
+    if (raw_dump_) raw_flush();
     parse_state_ = WAIT_HEADER;
     zero_count_ = 0;
     buf_pos_ = 0;
@@ -161,10 +288,24 @@ void Ademco4110Component::loop() {
 
   while (available()) {
     uint8_t b; read_byte(&b);
+    if (raw_dump_) {  // cattura grezza PRIMA di qualsiasi elaborazione
+      if (raw_len_ >= sizeof(raw_buf_)) raw_flush();   // buffer pieno: dump e riparti
+      if (raw_len_ == 0) raw_first_us_ = esp_timer_get_time();
+      raw_buf_[raw_len_++] = b;
+    }
     last_parse_ms_ = now;
     switch (parse_state_) {
       case WAIT_HEADER:
-        if (b == 0x00) {
+        if (new_parser_) {
+          // Nuovo framer: aggancia sul MARCATORE valido, saltando zeri E byte-
+          // spazzatura. Cattura anche i frame impacchettati (senza i 2 zeri di
+          // header) che il vecchio parser perde in raffica. Una spazzatura che
+          // coincide con un marcatore diventa un frame-fantasma isolato, filtrato
+          // a valle dal debounce su armed/alarm (in process_armed).
+          if (b != 0x00 && is_marker(b)) {
+            sep_byte_ = b; buf_pos_ = 0; parse_state_ = READ_DATA;
+          }
+        } else if (b == 0x00) {
           if (++zero_count_ >= 2) { parse_state_ = WAIT_SEP; zero_count_ = 0; }
         } else {
           zero_count_ = 0;
@@ -180,6 +321,8 @@ void Ademco4110Component::loop() {
         if (buf_pos_ < 4) break;
         last_msg_ms_ = now;
 
+        if (raw_dump_)
+          raw_flush();  // riga RAW del frame appena completato, allineata al DIAG sotto
         if (diagnostic_mode_)
           ESP_LOGI(TAG, "DIAG [0x%02X] B0=0x%02X B1=0x%02X B2=0x%02X B3=0x%02X",
                    sep_byte_, frame_buf_[0], frame_buf_[1], frame_buf_[2], frame_buf_[3]);
@@ -354,6 +497,21 @@ void Ademco4110Component::loop() {
     if (!num_keys_ && !key_idx_ && last_ki) { ESP_LOGI(TAG, "Seq. completata"); last_ki = 0; }
   }
 
+  // Diagnostica TX deterministica: se restano tasti in coda che non partono,
+  // logga quanti sono in attesa + il conteggio impulsi di sync. Confrontando 'sync'
+  // tra righe consecutive mentre i tasti sono fermi: se CRESCE -> il sync e' vivo
+  // (problema di timing/pannello); se resta FERMO -> il sync si e' fermato in idle
+  // (tastiera addormentata, serve svegliarla). Risponde all'incognita sync-in-idle.
+  if (diagnostic_mode_ && deterministic_tx_ && key_queue_) {
+    static uint32_t last_stall_log = 0;
+    UBaseType_t pending = uxQueueMessagesWaiting(key_queue_);
+    if (pending > 0 && (now - last_tx_ms_) > 500 && (now - last_stall_log) > 1000) {
+      ESP_LOGW(TAG, "coda TX ferma: %d in attesa, sync=%u, bus %dms fa",
+               (int) pending, (unsigned) isr_sync_count_, (int)(now - last_msg_ms_));
+      last_stall_log = now;
+    }
+  }
+
   static uint32_t last_warn = 0;
   if (last_msg_ms_ && (now - last_msg_ms_) > 15000 && (now - last_warn) > 15000) {
     ESP_LOGW(TAG, "Bus silenzioso da %ds", (int)((now - last_msg_ms_) / 1000));
@@ -397,11 +555,21 @@ void Ademco4110Component::process_status(uint8_t b0, uint8_t b1, uint8_t b2, uin
   bool ready  = (b2 & 0x02) == 0;  // attivo basso
   bool bypass = (b2 & 0x80) == 0;  // attivo basso
   bool chime_bit = (b3 & 0x02) != 0;
-  bool chime  = bypass ? !chime_bit : chime_bit;  // invertito col bypass
+  // Il bit del chime (B3 bit1) e' un bit di DISPLAY: il pannello lo INVERTE
+  // quando il display e' in modo "speciale" — bypass attivo OPPURE armato TOTALE
+  // (AWAY). NON lo inverte da parziale (STAY) ne' da disinserito. Verificato sui
+  // frame reali: disarmato/parziale chime-on -> bit1=1; armato-totale chime-off
+  // -> bit1=1 (invertito); bypass -> invertito. Doppia compensazione con XOR.
+  // (Cosmetici non testati: stato allarme, e armato-totale+bypass insieme.)
+  bool armed_total = system_state_ == STATE_ARMED_TOTAL;
+  bool chime = chime_bit ^ bypass ^ armed_total;
 
-  // Batteria scarica — IPOTESI da gregrenda (Byte2 bit6 BAT), attivo basso
-  // DA VERIFICARE staccando la batteria tampone: se invertito, cambiare == in !=
-  bool battery_low = (b2 & 0x40) == 0;
+  // Batteria scarica — Byte2 bit6 (attivo basso). ATTENZIONE: il bit6 si abbassa
+  // anche col bypass attivo + sistema non pronto (osservato B2=0x3E: bit6=0 senza
+  // batteria realmente scarica) → falso positivo. Lo sopprimiamo quando il bypass
+  // e' attivo. Rischio accettato: una batteria che si scaricasse *durante* un
+  // bypass verrebbe segnalata solo a bypass tolto (condizione lenta, ricompare).
+  bool battery_low = ((b2 & 0x40) == 0) && !bypass;
 
   ESP_LOGD(TAG, "STATUS B2=0x%02X B3=0x%02X | ready=%d chime=%d bypass=%d bat_low=%d",
            b2, b3, ready, chime, bypass, battery_low);
@@ -467,10 +635,18 @@ void Ademco4110Component::process_armed(uint8_t b0, uint8_t b1, uint8_t b2, uint
   }
   prev_alarm = alarm;
 
-  if (alarm && armed)              set_system_state(STATE_ALARM);
-  else if (armed && partial_seen_) set_system_state(STATE_ARMED_PARTIAL);
-  else if (armed)                  set_system_state(STATE_ARMED_TOTAL);
-  else                             set_system_state(STATE_DISARMED);
+  // Applicazione IMMEDIATA per entrambi i parser (nessun debounce). Il debounce
+  // sull'allarme e' stato tolto: durante un allarme e' il DISPLAY (frame 0x04) a
+  // essere fitto, mentre i frame 0x0C -- gli unici su cui gira process_armed --
+  // restano RADI (uno per ciclo). Un debounce a 2 frame 0x0C ritarderebbe (o
+  // mancherebbe) lo scatto, inaccettabile per un allarme. Il rischio-fantasma del
+  // nuovo framer (collisione marcatore-spazzatura) e' bassissimo, mai emerso nei
+  // test, e auto-correttivo al frame successivo: preferibile a un allarme lento.
+  SystemState target = (alarm && armed)         ? STATE_ALARM
+                     : (armed && partial_seen_) ? STATE_ARMED_PARTIAL
+                     : armed                    ? STATE_ARMED_TOTAL
+                     :                            STATE_DISARMED;
+  set_system_state(target);
 }
 
 void Ademco4110Component::set_system_state(SystemState s) {
@@ -602,6 +778,21 @@ uint8_t Ademco4110Component::char_to_key(char c) {
 }
 
 void Ademco4110Component::send_keys(const char *keys) {
+  if (deterministic_tx_) {
+    // Percorso deterministico: accoda i tasti nella FreeRTOS queue (thread-safe
+    // e cross-core), tx_task ne estrae uno per impulso di sync. Niente guardia
+    // "TX in corso": la coda gestisce la concorrenza.
+    int n = 0;
+    for (int i = 0; keys[i]; i++) {
+      uint8_t k = char_to_key(keys[i]);
+      if (k == 0xFF) continue;
+      if (xQueueSend(key_queue_, &k, 0) == pdTRUE) n++;
+      else ESP_LOGW(TAG, "coda TX piena, tasto perso");
+    }
+    if (n) ESP_LOGI(TAG, "Coda: %d tasti", n);
+    return;
+  }
+  // --- percorso vecchio (deterministic_tx: false) ---
   if (num_keys_) { ESP_LOGW(TAG, "TX in corso"); return; }
   num_keys_ = 0; key_idx_ = 0;
   for (int i = 0; keys[i] && num_keys_ < 10; i++) {

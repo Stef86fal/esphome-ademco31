@@ -12,6 +12,7 @@
 #include <esp_timer.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 namespace esphome {
 namespace ademco4110 {
@@ -21,6 +22,9 @@ static const uint32_t   RMT_RESOLUTION_HZ = 1000000;  // 1 tick = 1us (come prim
 static const uint16_t   BIT_TICKS = 417;
 static const uint64_t   SYNC_MIN_US = 171000;
 static const uint32_t   BUS_OK_SILENCE_MS = 60000;  // soglia sensore "Comunicazione Bus" (diverso dal warning nel log, che resta a 15s)
+static const uint32_t   RMT_TX_TIMEOUT_MS = 100;    // attesa max fine trasmissione (3 byte = ~12.5ms, 8x di margine)
+static const uint32_t   TX_OFFSET_US = 4000;        // offset dall'aggancio del sync prima di trasmettere (deterministic_tx; = i 4ms del vecchio percorso)
+static const uint32_t   MIN_KEY_GAP_US = 500000;    // minimo tra tasti (0.5s): sotto questa soglia il pannello si impalla (indicazione del tecnico, confermata dai log). Tunabile.
 
 enum ParseState { WAIT_HEADER, WAIT_SEP, READ_DATA };
 enum SystemState {
@@ -44,6 +48,9 @@ class Ademco4110Component : public Component, public uart::UARTDevice {
   void set_bus_ok_sensor(binary_sensor::BinarySensor *s)        { bus_ok_sensor_ = s; }
   void set_status_sensor(text_sensor::TextSensor *s)            { status_sensor_ = s; }
   void set_diagnostic_mode(bool v)                              { diagnostic_mode_ = v; }
+  void set_raw_dump(bool v)                                     { raw_dump_ = v; }
+  void set_new_parser(bool v)                                   { new_parser_ = v; }
+  void set_deterministic_tx(bool v)                             { deterministic_tx_ = v; }
 
   void setup() override;
   void loop() override;
@@ -88,14 +95,14 @@ class Ademco4110Component : public Component, public uart::UARTDevice {
   uint8_t     pending_zone_sep_{0};  // separatore pre-0x0C catturato durante lo scan
   static constexpr const char* ZONE_NAMES[9] = {
     "",                    // indice 0 (non usato)
-    "ZONE 1",       // zona 1
-    "ZONE 2",       // zona 2
-    "ZONE 3",       // zona 3
+    "ZONE 1",          // zona 1
+    "ZONE 2",      // zona 2
+    "ZONE 3",      // zona 3
     "ZONE 4",       // zona 4
-    "ZONE 5",       // zona 5
+    "ZONE 5",      // zona 5
     "ZONE 6",       // zona 6
-    "ZONE 7",       // zona 7
-    "ZONE 8"        // zona 8
+    "ZONE 7",              // zona 7
+    "ZONE 8"          // zona 8
   };
   std::string disarm_code_;
 
@@ -133,12 +140,44 @@ class Ademco4110Component : public Component, public uart::UARTDevice {
 
   bool        diagnostic_mode_{false};
 
+  // RAW dump: byte grezzi dal bus PRIMA del parsing (diagnostica disallineamento).
+  // Log-only, opt-in via YAML (raw_dump: true). Non tocca la logica dell'allarme.
+  bool        raw_dump_{false};
+  uint8_t     raw_buf_[48]{};
+  uint8_t     raw_len_{0};
+  uint64_t    raw_first_us_{0};
+
+  // Doppio sistema di lettura, switchabile da YAML (new_parser: true/false).
+  // false = macchina a stati a 2 zeri di header (vecchio parser, fallback).
+  // true  = framer a marcatori: aggancia sul marcatore valido saltando zeri e
+  //         spazzatura, cosi' cattura i frame impacchettati che il vecchio perde
+  //         in raffica (sensori molto piu' reattivi). Cambia SOLO WAIT_HEADER;
+  //         READ_DATA e tutta la logica frame sono identici. NESSUN debounce: gli
+  //         stati (incluso l'allarme) si applicano subito.
+  bool        new_parser_{false};
+
+  // TX deterministica (deterministic_tx: true): un ISR sul sync pin sveglia
+  // tx_task (prio 24, BLOCCATO -> 0% CPU a riposo, quindi NON affama il WiFi
+  // come il vecchio busy-loop a prio 24) che allinea la trasmissione all'istante
+  // hardware catturato nell'ISR, togliendo lo scheduler dal percorso del trigger.
+  // La coda FreeRTOS e' l'unica fonte di verita' (niente flag di arming).
+  // false = vecchio sync_task in polling (fallback, invariato).
+  bool             deterministic_tx_{false};
+  QueueHandle_t    key_queue_{nullptr};
+  TaskHandle_t     tx_task_handle_{nullptr};
+  int64_t          isr_last_edge_us_{0};   // solo ISR (un core) -> nessun lock
+  volatile uint32_t isr_sync_count_{0};    // diag: impulsi di sync visti dall'ISR (vivo se cresce, fermo se no)
+  volatile uint32_t last_tx_ms_{0};        // diag: ultimo tasto realmente trasmesso da tx_task
+
   rmt_channel_handle_t rmt_tx_chan_{nullptr};
   rmt_encoder_handle_t rmt_copy_encoder_{nullptr};
 
   void rmt_tx_init();
   void rmt_tx_send_key(uint8_t key);
   static void sync_task(void *arg);
+  static void sync_isr(Ademco4110Component *self);  // IRAM_ATTR sulla definizione
+  static void tx_task(void *arg);
+  void raw_flush();
   void process_status(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3);
   void process_armed(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3);
   void finish_zone_scan();

@@ -17,6 +17,9 @@ ScanZonesAction = ademco4110_ns.class_("ScanZonesAction", automation.Action)
 CONF_SYNC_PIN    = "sync_pin"
 CONF_KEYS        = "keys"
 CONF_DIAGNOSTIC  = "diagnostic_mode"
+CONF_RAW_DUMP    = "raw_dump"
+CONF_NEW_PARSER  = "new_parser"
+CONF_DETERMINISTIC_TX = "deterministic_tx"
 CONF_TYPE        = "type"
 CONF_DISARM_CODE = "disarm_code"
 
@@ -38,6 +41,9 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Required(CONF_UART_ID): cv.use_id(uart.UARTComponent),
     cv.Optional(CONF_SYNC_PIN): pins.internal_gpio_input_pin_schema,
     cv.Optional(CONF_DIAGNOSTIC, default=False): cv.boolean,
+    cv.Optional(CONF_RAW_DUMP, default=False): cv.boolean,
+    cv.Optional(CONF_NEW_PARSER, default=False): cv.boolean,
+    cv.Optional(CONF_DETERMINISTIC_TX, default=False): cv.boolean,
     cv.Optional(CONF_DISARM_CODE, default=""): cv.string,
 }).extend(cv.COMPONENT_SCHEMA)
 
@@ -92,4 +98,7 @@ async def to_code(config):
         sync = await cg.gpio_pin_expression(config[CONF_SYNC_PIN])
         cg.add(var.set_sync_pin(sync))
     cg.add(var.set_diagnostic_mode(config[CONF_DIAGNOSTIC]))
+    cg.add(var.set_raw_dump(config[CONF_RAW_DUMP]))
+    cg.add(var.set_new_parser(config[CONF_NEW_PARSER]))
+    cg.add(var.set_deterministic_tx(config[CONF_DETERMINISTIC_TX]))
     cg.add(var.set_disarm_code(config[CONF_DISARM_CODE]))
