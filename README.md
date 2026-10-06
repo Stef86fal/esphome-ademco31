@@ -4,12 +4,13 @@ Interface legacy, non-addressable Ademco/Honeywell alarm panels (keypad **Addres
 
 Unlike modern Vista panels (which use ECP addressable keypads), older generations drive a continuous **2400-baud** keybus that projects like AlarmDecoder or Envisalink cannot read. This firmware reads that bus directly and reconstructs the full panel state from the three keybus wires.
 
-> ⚠️ **Status:** actively developed and **fully tested on an Ademco 4120 with a 4127 fixed-word keypad.** Firmware is at **v2** (see the [VERSION 2](#-version-2--whats-new) section), which adds ESPHome 2026.x compatibility, passive bypass/alarm-zone detection, more reliable state reading, and several diagnostic sensors on top of the original v19 base. Other panels/keypads are listed as *likely* compatible but are **untested** — see the compatibility and protocol-landscape sections.
+> ⚠️ **Status:** actively developed and **fully tested on an Ademco 4120 with a 4127 fixed-word keypad.** Firmware is at **v3** (see the [VERSION 3](#-version-3--whats-new) and [VERSION 2](#-version-2--whats-new) sections). On top of the original v19 base it adds ESPHome 2026.x compatibility, a marker-based RX parser, passive bypass/alarm-zone detection, more reliable state reading, a WiFi/thermal fix, and several diagnostic sensors. Other panels/keypads are listed as *likely* compatible but are **untested** — see the compatibility and protocol-landscape sections.
 
 ---
 
 ## 📑 Table of contents
 
+- [VERSION 3 — what's new](#-version-3--whats-new)
 - [VERSION 2 — what's new](#-version-2--whats-new)
 - [Which quadrant are you in?](#-which-quadrant-are-you-in-protocol-landscape)
 - [Features](#-features)
@@ -26,6 +27,53 @@ Unlike modern Vista panels (which use ECP addressable keypads), older generation
 - [Limitations / to-do](#-known-limitations--to-do)
 - [License](#-license)
 - [Credits](#-credits)
+
+---
+
+## 🆕 VERSION 3 — what's new
+
+Version 3 builds on v2. The core protocol decoding is unchanged; v3 adds a more robust RX parser, a WiFi/thermal fix, a raw-capture diagnostic, and — the main effort — a deep investigation of **key-transmission reliability** that produced an optional interrupt-driven TX path (shipped **off** by default) and a much clearer root cause for the "command sometimes lost" behaviour. All validated on the real 4120 + 4127.
+
+### New: marker-based RX parser (`new_parser`, default on)
+
+The original parser started a frame only after seeing two `0x00` header bytes. When frames pack together without that header (a `0xBE` display frame ending in `0x00` immediately followed by a `0x0C`, for example), the next frame was swallowed — frames were lost during keypress bursts, making sensors lag or need a second cycle to update.
+
+The new parser instead aligns on a **valid marker** (`0x24` / `0x0C` / `0x04` and the zone separators `0xBC–0xF4`), skipping zeros **and** junk bytes between frames. Only the header-sync step changed — `READ_DATA` and all frame handling are identical. Result: the packed frames are caught, so sensors update faster and more consistently. The old 2-zero parser is kept as a fallback (`new_parser: false`). An extended idle/not-ready stress run (~17 min, ~4000 frames) showed **zero** phantom frames with the new framer.
+
+### New: WiFi / thermal fix (power-save + task priority)
+
+API timeouts (Home Assistant losing the device) were traced to `sync_task` running at FreeRTOS **priority 24** on Core 0, where it outranked the WiFi (23) and TCP/IP (18) tasks and starved the network. Lowering `sync_task` to **priority 10** (still well above the ESPHome loop at 1) fixed the timeouts and made it safe to run `wifi: power_save_mode: light` — the radio sleeps between beacons (cooler board) without dropping packets.
+
+### New: `raw_dump` diagnostic mode
+
+Opt-in (`raw_dump: true`): logs the raw bytes received from the bus **before** parsing, alongside the existing `DIAG` lines, one line per frame. Purely for diagnosing frame alignment/timing — it never touches the alarm logic.
+
+### Protocol refinements
+
+- **Low-battery false positive during bypass is now suppressed.** The v2 caveat (bit 6 of `B2` briefly signalling low battery while "not ready" during bypass) is handled: `battery_low = ((b2 & 0x40) == 0) && !bypass`. Accepted trade-off — a battery that genuinely died *during* an active bypass would only be flagged once bypass clears (a slow, self-recovering condition).
+- **Chime inversion extended.** The chime display bit (`B3` bit 1) inverts not only when bypass is active but also when **armed-total** (AWAY). Both are compensated: `chime = chime_bit ^ bypass ^ (state == ARMED_TOTAL)`. Confirmed against real captures. (Only untested combo: armed-total + bypass together — a non-use-case here.)
+
+### Key transmission — investigated, and an optional deterministic TX (default OFF)
+
+V2 noted that "the first command after long idle may be lost." V3 investigated this thoroughly and **refined the root cause** — it is neither panel-sleep nor WiFi jitter:
+
+- **Disarm after *hours* of idle works reliably.** The bus and sync pulse are present even in deep idle, so the panel is not "asleep" and the ESP transmits fine when the bus is quiet.
+- **The real trigger is the keypad LCD's continuous multiplex refresh.** While the panel is actively driving the display (streaming `0x24` / `B0=0xBE` frames), the ~17 ms sync window that key transmission locks onto gets **starved / mis-phased**, so keys sent *during display activity* can miss their window. A long command — e.g. a 9-key multi-zone bypass, which itself makes the display refresh to show the zones — is the worst case and can be truncated by the panel's inter-digit timeout.
+
+An experimental **`deterministic_tx`** path was built to fight this: a GPIO interrupt on the sync pin wakes a high-priority, blocking FreeRTOS task that sends one key per real sync window with a 0.5 s pacing (the minimum the panel tolerates before it jams). It is **more responsive** on short commands (arm/disarm), **but** its raw edge-ISR — unlike the polling loop's implicit ~1 ms filtering — **starves during the display refresh and truncates long commands like the bypass**.
+
+- **Decision: `deterministic_tx` ships OFF by default.** The proven **polling `sync_task`** is the daily driver: its 1 ms sampling filters the display-refresh noise and reliably sends *all* commands, bypass included. The deterministic path stays in the code behind the flag for experimentation.
+- A cross-check tapping the **RX data line** (as gregrenda does) instead of the separate sync pin did **not** help: on this panel the data line's inter-frame gap compresses during the refresh just like the sync pin, so no bus-derived sync source is clean during display activity. This appears specific to the old 4120 + 4127's display behaviour.
+- **The definitive fix** — covering even sends during display refresh — would be to capture the *physical* keypad's exact bus timing with a **logic analyzer** and replicate it 1:1, rather than reverse-engineering the sync window heuristically. Noted as future work.
+
+### Config flags (v3)
+
+| Flag | Default | Effect |
+|---|---|---|
+| `new_parser` | `true` | marker-based RX framer (v3); `false` = old 2-zero parser (fallback) |
+| `deterministic_tx` | `false` | interrupt+task key TX — more reactive but **truncates long commands during display refresh**; `false` = proven polling (recommended) |
+| `diagnostic_mode` | `false` | verbose `DIAG` frame logging |
+| `raw_dump` | `false` | raw pre-parse byte dump (v3) |
 
 ---
 
@@ -132,7 +180,7 @@ Exposed to Home Assistant:
 - **Chime**, **Ready / Not Ready**, **Bypass (zone excluded)** status
 - **Mains (AC 220 V) presence** — detected via the dedicated "NO AC" bus frame, with hysteresis
 - **Low-battery** flag (see the important caveat below)
-- **Named zones** instead of bare numbers (e.g. "TAPPARELLE PT" instead of "4")
+- **Named zones** instead of bare numbers (e.g. a room name instead of a bare number)
 - **Diagnostic sensors** *(new in v2)*: ESP32 temperature, WiFi signal + BSSID, uptime, bus communication, restart button
 - A custom **Lovelace keypad card** (mobile-friendly) mirroring the physical keypad, with RETE (mains) and BATT badges
 
@@ -361,7 +409,7 @@ Cheap second-hand boards (4110/4120 series) are widely available and make a safe
 - **Mains (AC) detection**: confirmed via the dedicated NO-AC frame (`B1=0xDF B2=0x6C B3=0x5E`); B0 is ignored (multiplexed display byte). During a blackout chime/ready/bypass are frozen at their last known value; armed/alarm remain live and accurate.
 - **Low-battery** flag is a coarse fault indicator, not a health gauge. On these old panels it's set only when a periodic weak load-test fails — it flags a dead/disconnected battery, not a degrading one. Treat it as a fault indicator, not a health readout; for real health, measure battery voltage directly. *(v2: it also briefly false-triggers during a bypass operation — cosmetic, self-clearing, a debounce is deferred.)*
 - **CHECK indicator** (loop trouble / faulty sensor wiring) is visible on the keypad display but **not yet mapped** on the bus. Unlike mains/battery it can't be safely toggled on demand — it reflects a real loop fault (open wiring, bad EOLR). A candidate exists from the gregrenda cross-check (B2 bit1 of the 0x0C frame) but it may instead be a message frame carrying the faulty zone number, like the NO-AC and zone frames. To be mapped opportunistically: with `diagnostic_mode: true`, open an EOLR-supervised zone loop (e.g. disconnect the HI wire of a supervised zone for a minute) and capture the log, or wait for a real fault.
-- **First command after long idle may be lost** and need re-sending — inherent to the protocol (see the [VERSION 2](#-version-2--whats-new) notes). A long multi-zone bypass can execute partially for the same reason; the bypassed-zone sensor always reflects what actually took.
+- **A command can be lost/truncated if sent while the keypad display is actively refreshing** — not after idle (disarm after hours of idle is reliable), but during the LCD's multiplex refresh, which starves the sync window mid-sequence. The proven polling TX handles this well; the experimental `deterministic_tx` does not (it truncates long commands like the bypass) and is off by default. See the [VERSION 3](#-version-3--whats-new) notes. The definitive fix is a logic-analyzer 1:1 capture of the physical keypad's bus timing — future work. The bypassed-zone sensor always reflects what actually took, so a partial bypass is always visible.
 - **Alarm during blackout**: logic is safe by construction (the alarm frame is distinct from the NO-AC frame and always processed), but not yet captured live. To confirm: arm the system, disconnect mains, trigger a test alarm.
 - Compatibility beyond the 4120/4127 is theoretical.
 - Zone names are hard-coded (edit the `ZONE_NAMES` array to match your installation).
